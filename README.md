@@ -45,8 +45,19 @@ Design notes and open decisions: [DESIGN.md](DESIGN.md).
 
 | Metric | Value |
 |---|---|
-| Tests | 15 (invariants enforced by the DB alone, idempotency, overdraft) |
-| Concurrency / balance-read latency | not measured yet |
+| Tests | 20 (DB-only invariant checks, idempotency, overdraft, 5 concurrency) |
+
+Posting benchmark (`npm run bench`, 2,000 transfers per scenario, pool of 20, Postgres 17 in Docker on an Apple-silicon
+laptop, two runs):
+
+| Scenario | Throughput | p50 | p99 |
+|---|---|---|---|
+| Sequential, one account pair | ~415 tx/s | 2.4 ms | 3.1–3.5 ms |
+| 20 concurrent, **one hot pair** | ~570 tx/s | 36–37 ms | 56–57 ms |
+| 20 concurrent, 20 disjoint pairs | ~2,370 tx/s | 8.3 ms | 12–15 ms |
+
+A hot account barely scales: every posting holds its row lock from `FOR UPDATE` to `COMMIT`, so the 20 workers mostly
+queue. Spread across accounts, the same code does ~4× the throughput.
 
 ## What I learned / what I'd do differently
 

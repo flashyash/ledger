@@ -10,7 +10,8 @@
     "db:down": "docker compose down",
     "migrate": "node src/migrate.ts",
     "test": "vitest run",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "bench": "node scripts/bench-posting.ts"
   },
   "type": "module",
   "private": true,

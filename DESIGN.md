@@ -25,11 +25,14 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
 ## Known gaps
 - A later DB transaction could append a balanced pair of entries to an old transaction. Fix: reject entries whose
   transaction was created in a different DB transaction.
-- Hot accounts (e.g. `world`/clearing) serialize every deposit. Measure first, then consider sharded sub-accounts.
+- Hot accounts (e.g. `world`/clearing) serialize every deposit. Measured: one hot pair ≈ 570 tx/s, p99 ≈ 57 ms vs
+  ≈ 2,370 tx/s on disjoint pairs. Options: split a hot account into N sub-accounts, or skip the balance lock for
+  `allow_negative` accounts (no overdraft check needed) and update their cache asynchronously.
 
 ## Milestones (≤3 h each, green test + commit)
 - [x] Scaffold, schema with DB-enforced invariants, `postTransaction` + idempotency, 15 tests, CI
-- [ ] Concurrency: parallel transfers stay zero-sum, no lost updates; same key fired 10× → one transaction
+- [x] Concurrency: parallel transfers stay zero-sum, no lost updates; same key fired 10× → one transaction;
+      racing withdrawals can't overdraw; deadlock demo; posting benchmark (README)
 - [ ] Reversals: `reverseTransaction()` posts the negated entries, linked to the original
 - [ ] Balances at scale: seed ~1M entries, time naive `SUM` vs cached read
 - [ ] HTTP API (`POST /transfers` with `Idempotency-Key` header) + p50/p99 under load
