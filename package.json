@@ -1,0 +1,29 @@
+{
+  "name": "ledger",
+  "version": "1.0.0",
+  "description": "Double-entry ledger service (TypeScript + Postgres)",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "migrate": "node src/migrate.ts",
+    "test": "vitest run",
+    "typecheck": "tsc"
+  },
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

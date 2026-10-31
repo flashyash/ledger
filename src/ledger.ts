@@ -1,0 +1,224 @@
+import { createHash } from "node:crypto";
+import type { Pool } from "./db.ts";
+
+export interface EntryInput {
+  accountId: string;
+  amount: bigint; // signed minor units: negative = money leaves the account
+}
+
+export interface PostTransactionInput {
+  idempotencyKey: string;
+  description?: string;
+  effectiveAt?: Date;
+  entries: EntryInput[];
+}
+
+export interface PostResult {
+  transactionId: string;
+  replayed: boolean; // true when this key was already processed and we returned the stored result
+}
+
+export class ValidationError extends Error {
+  name = "ValidationError";
+}
+export class AccountNotFoundError extends Error {
+  name = "AccountNotFoundError";
+}
+export class InsufficientFundsError extends Error {
+  name = "InsufficientFundsError";
+}
+export class IdempotencyConflictError extends Error {
+  name = "IdempotencyConflictError";
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function createAccount(
+  pool: Pool,
+  opts: { name: string; currency: string; allowNegative?: boolean },
+): Promise<string> {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const { rows } = await client.query<{ id: string }>(
+      "insert into accounts (name, currency, allow_negative) values ($1, $2, $3) returning id",
+      [opts.name, opts.currency, opts.allowNegative ?? false],
+    );
+    await client.query("insert into balances (account_id) values ($1)", [rows[0].id]);
+    await client.query("commit");
+    return rows[0].id;
+  } catch (err) {
+    await client.query("rollback");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getBalance(pool: Pool, accountId: string): Promise<bigint> {
+  const { rows } = await pool.query<{ balance: bigint }>(
+    "select balance from balances where account_id = $1",
+    [accountId],
+  );
+  if (rows.length === 0) throw new AccountNotFoundError(`account ${accountId} not found`);
+  return rows[0].balance;
+}
+
+export async function postTransaction(pool: Pool, input: PostTransactionInput): Promise<PostResult> {
+  validate(input);
+  const hash = requestHash(input);
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    // Claim the key. If another request holds it uncommitted, this blocks until that one commits or rolls back.
+    const claimed = await client.query(
+      "insert into idempotency_keys (key, request_hash) values ($1, $2) on conflict (key) do nothing",
+      [input.idempotencyKey, hash],
+    );
+    if (claimed.rowCount === 0) {
+      await client.query("rollback");
+      return await replay(pool, input.idempotencyKey, hash);
+    }
+
+    const deltas = new Map<string, bigint>();
+    for (const e of input.entries) deltas.set(e.accountId, (deltas.get(e.accountId) ?? 0n) + e.amount);
+    const accountIds = [...deltas.keys()];
+
+    // Lock every touched balance row, always in account-id order, so two transfers over
+    // the same accounts (A→B and B→A) queue behind each other instead of deadlocking.
+    const { rows: locked } = await client.query<{
+      account_id: string;
+      balance: bigint;
+      currency: string;
+      allow_negative: boolean;
+    }>(
+      `select b.account_id, b.balance, a.currency, a.allow_negative
+         from balances b join accounts a on a.id = b.account_id
+        where b.account_id = any($1::uuid[])
+        order by b.account_id
+          for update of b`,
+      [accountIds],
+    );
+    if (locked.length !== accountIds.length) {
+      const found = new Set(locked.map((r) => r.account_id));
+      throw new AccountNotFoundError(`account ${accountIds.find((id) => !found.has(id))} not found`);
+    }
+    const accounts = new Map(locked.map((r) => [r.account_id, r]));
+
+    // App-level zero-sum check per currency, for a clear error. The deferred DB trigger is the real guarantee.
+    const byCurrency = new Map<string, bigint>();
+    for (const e of input.entries) {
+      const ccy = accounts.get(e.accountId)!.currency;
+      byCurrency.set(ccy, (byCurrency.get(ccy) ?? 0n) + e.amount);
+    }
+    for (const [ccy, total] of byCurrency) {
+      if (total !== 0n) throw new ValidationError(`entries do not sum to zero in ${ccy} (off by ${total})`);
+    }
+
+    for (const [id, delta] of deltas) {
+      const acct = accounts.get(id)!;
+      if (!acct.allow_negative && acct.balance + delta < 0n) {
+        throw new InsufficientFundsError(`account ${id} has ${acct.balance}, needs ${-delta}`);
+      }
+    }
+
+    const { rows: txn } = await client.query<{ id: string }>(
+      "insert into transactions (description, effective_at) values ($1, coalesce($2, now())) returning id",
+      [input.description ?? "", input.effectiveAt ?? null],
+    );
+    const transactionId = txn[0].id;
+
+    await client.query(
+      `insert into entries (transaction_id, account_id, currency, amount)
+       select $1, t.account_id, t.currency, t.amount
+         from unnest($2::uuid[], $3::char(3)[], $4::bigint[]) as t(account_id, currency, amount)`,
+      [
+        transactionId,
+        input.entries.map((e) => e.accountId),
+        input.entries.map((e) => accounts.get(e.accountId)!.currency),
+        input.entries.map((e) => e.amount.toString()),
+      ],
+    );
+
+    await client.query(
+      `update balances b set balance = b.balance + d.delta, updated_at = now()
+         from unnest($1::uuid[], $2::bigint[]) as d(account_id, delta)
+        where b.account_id = d.account_id`,
+      [accountIds, accountIds.map((id) => deltas.get(id)!.toString())],
+    );
+
+    await client.query("update idempotency_keys set transaction_id = $1 where key = $2", [
+      transactionId,
+      input.idempotencyKey,
+    ]);
+
+    await client.query("commit"); // deferred zero-sum trigger runs here
+    return { transactionId, replayed: false };
+  } catch (err) {
+    // The key row is rolled back too, so a rejected request doesn't burn its key: a retry runs again.
+    await client.query("rollback").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function replay(pool: Pool, key: string, hash: string): Promise<PostResult> {
+  const { rows } = await pool.query<{ request_hash: string; transaction_id: string | null }>(
+    "select request_hash, transaction_id from idempotency_keys where key = $1",
+    [key],
+  );
+  // The key and its transaction commit together, so a visible key always has a transaction_id.
+  if (rows.length === 0 || rows[0].transaction_id === null) {
+    throw new Error(`idempotency key ${key} conflicted but has no committed result`);
+  }
+  if (rows[0].request_hash !== hash) {
+    throw new IdempotencyConflictError(`idempotency key ${key} was already used with a different request`);
+  }
+  return { transactionId: rows[0].transaction_id, replayed: true };
+}
+
+function validate(input: PostTransactionInput): void {
+  if (!input.idempotencyKey || input.idempotencyKey.length > 255) {
+    throw new ValidationError("idempotencyKey must be 1–255 characters");
+  }
+  if (input.entries.length < 2) throw new ValidationError("a transaction needs at least 2 entries");
+  for (const e of input.entries) {
+    if (!UUID.test(e.accountId)) throw new ValidationError(`invalid account id ${e.accountId}`);
+    if (typeof e.amount !== "bigint" || e.amount === 0n) {
+      throw new ValidationError("each amount must be a non-zero bigint (minor units)");
+    }
+  }
+}
+
+// Fingerprint of the request's meaning. Entries are sorted so the same transfer listed in a
+// different order hashes the same; ids are lowercased because Postgres treats uuids case-insensitively.
+export function requestHash(input: PostTransactionInput): string {
+  const canonical = {
+    description: input.description ?? "",
+    effectiveAt: input.effectiveAt?.toISOString() ?? null,
+    entries: input.entries
+      .map((e) => [e.accountId.toLowerCase(), e.amount.toString()])
+      .sort((a, b) => (a[0] + a[1] < b[0] + b[1] ? -1 : a[0] + a[1] > b[0] + b[1] ? 1 : 0)),
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export interface Drift {
+  accountId: string;
+  cached: bigint;
+  actual: bigint;
+}
+
+// Recomputes every balance from the entries (the source of truth) and reports any account whose cache drifted.
+// One statement = one snapshot, and entries + balance updates commit together, so in-flight posts can't cause false drift.
+export async function reconcile(pool: Pool): Promise<Drift[]> {
+  const { rows } = await pool.query<{ account_id: string; cached: bigint; actual: bigint }>(
+    `select b.account_id, b.balance as cached, coalesce(sum(e.amount), 0)::bigint as actual
+       from balances b left join entries e on e.account_id = b.account_id
+      group by b.account_id, b.balance
+     having b.balance <> coalesce(sum(e.amount), 0)`,
+  );
+  return rows.map((r) => ({ accountId: r.account_id, cached: r.cached, actual: r.actual }));
+}
