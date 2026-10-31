@@ -13,6 +13,10 @@ export interface PostTransactionInput {
   entries: EntryInput[];
 }
 
+interface PostInput extends PostTransactionInput {
+  reversesId?: string;
+}
+
 export interface PostResult {
   transactionId: string;
   replayed: boolean; // true when this key was already processed and we returned the stored result
@@ -29,6 +33,12 @@ export class InsufficientFundsError extends Error {
 }
 export class IdempotencyConflictError extends Error {
   name = "IdempotencyConflictError";
+}
+export class TransactionNotFoundError extends Error {
+  name = "TransactionNotFoundError";
+}
+export class AlreadyReversedError extends Error {
+  name = "AlreadyReversedError";
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -64,7 +74,33 @@ export async function getBalance(pool: Pool, accountId: string): Promise<bigint>
   return rows[0].balance;
 }
 
-export async function postTransaction(pool: Pool, input: PostTransactionInput): Promise<PostResult> {
+export function postTransaction(pool: Pool, input: PostTransactionInput): Promise<PostResult> {
+  return post(pool, input);
+}
+
+// Undoes a transaction by posting its exact negation, linked to the original. The original stays in history.
+// Subject to the same rules as any posting: idempotent, and it can't overdraw an account (e.g. reversing a
+// deposit whose money was already spent fails with InsufficientFundsError).
+export async function reverseTransaction(
+  pool: Pool,
+  opts: { transactionId: string; idempotencyKey: string; description?: string },
+): Promise<PostResult> {
+  if (!UUID.test(opts.transactionId)) throw new ValidationError(`invalid transaction id ${opts.transactionId}`);
+  // Entries are immutable, so reading them outside the posting transaction is safe.
+  const { rows } = await pool.query<{ account_id: string; amount: bigint }>(
+    "select account_id, amount from entries where transaction_id = $1 order by id",
+    [opts.transactionId],
+  );
+  if (rows.length === 0) throw new TransactionNotFoundError(`transaction ${opts.transactionId} not found`);
+  return post(pool, {
+    idempotencyKey: opts.idempotencyKey,
+    description: opts.description ?? `reversal of ${opts.transactionId}`,
+    reversesId: opts.transactionId,
+    entries: rows.map((r) => ({ accountId: r.account_id, amount: -r.amount })),
+  });
+}
+
+async function post(pool: Pool, input: PostInput): Promise<PostResult> {
   validate(input);
   const hash = requestHash(input);
   const client = await pool.connect();
@@ -106,6 +142,14 @@ export async function postTransaction(pool: Pool, input: PostTransactionInput): 
     }
     const accounts = new Map(locked.map((r) => [r.account_id, r]));
 
+    // Checked after taking the locks: a racing reversal of the same transaction touches the same accounts, so by
+    // now it has committed or rolled back, and this statement sees the outcome. Without this, reversing a deposit
+    // twice would fail the funds check and report the wrong error. The unique index is the backstop.
+    if (input.reversesId) {
+      const prior = await client.query("select 1 from transactions where reverses_id = $1", [input.reversesId]);
+      if (prior.rowCount) throw new AlreadyReversedError(`transaction ${input.reversesId} is already reversed`);
+    }
+
     // App-level zero-sum check per currency, for a clear error. The deferred DB trigger is the real guarantee.
     const byCurrency = new Map<string, bigint>();
     for (const e of input.entries) {
@@ -124,8 +168,9 @@ export async function postTransaction(pool: Pool, input: PostTransactionInput): 
     }
 
     const { rows: txn } = await client.query<{ id: string }>(
-      "insert into transactions (description, effective_at) values ($1, coalesce($2, now())) returning id",
-      [input.description ?? "", input.effectiveAt ?? null],
+      `insert into transactions (description, effective_at, reverses_id)
+       values ($1, coalesce($2, now()), $3) returning id`,
+      [input.description ?? "", input.effectiveAt ?? null, input.reversesId ?? null],
     );
     const transactionId = txn[0].id;
 
@@ -158,6 +203,10 @@ export async function postTransaction(pool: Pool, input: PostTransactionInput): 
   } catch (err) {
     // The key row is rolled back too, so a rejected request doesn't burn its key: a retry runs again.
     await client.query("rollback").catch(() => {});
+    const pgErr = err as { code?: string; constraint?: string };
+    if (pgErr.code === "23505" && pgErr.constraint === "transactions_reverses_once") {
+      throw new AlreadyReversedError(`transaction ${input.reversesId} is already reversed`);
+    }
     throw err;
   } finally {
     client.release();
@@ -194,9 +243,10 @@ function validate(input: PostTransactionInput): void {
 
 // Fingerprint of the request's meaning. Entries are sorted so the same transfer listed in a
 // different order hashes the same; ids are lowercased because Postgres treats uuids case-insensitively.
-export function requestHash(input: PostTransactionInput): string {
+export function requestHash(input: PostInput): string {
   const canonical = {
     description: input.description ?? "",
+    reversesId: input.reversesId?.toLowerCase() ?? null,
     effectiveAt: input.effectiveAt?.toISOString() ?? null,
     entries: input.entries
       .map((e) => [e.accountId.toLowerCase(), e.amount.toString()])

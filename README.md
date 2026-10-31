@@ -30,6 +30,7 @@ Needs Node ≥ 24 and Docker. Postgres runs on `localhost:5433` (see `docker-com
 | Entry currency = account currency | — | composite FK `(account_id, currency)` |
 | History is append-only | — | triggers reject `UPDATE`/`DELETE`/`TRUNCATE` |
 | No overdraft (unless `allow_negative`) | checked under row lock | — |
+| A transaction is reversed at most once | clear `AlreadyReversedError` | partial unique index on `reverses_id` |
 | Cached balance = sum of entries | updated in the same transaction | `reconcile()` reports any drift |
 
 **Posting** (`postTransaction`), all in one Postgres transaction:
@@ -39,13 +40,17 @@ Needs Node ≥ 24 and Docker. Postgres runs on `localhost:5433` (see `docker-com
 3. Check currencies and funds, insert the transaction and entries, bump balances, link the key.
 4. `COMMIT`. The zero-sum trigger runs here.
 
+**Reversing** (`reverseTransaction`) posts the exact negation of a transaction's entries as a new transaction
+with `reverses_id` pointing at the original. Nothing is edited: history shows the mistake and its undo. It goes
+through the same posting path, so it's idempotent and can't overdraw an account.
+
 Design notes and open decisions: [DESIGN.md](DESIGN.md).
 
 ## Numbers
 
 | Metric | Value |
 |---|---|
-| Tests | 20 (DB-only invariant checks, idempotency, overdraft, 5 concurrency) |
+| Tests | 27 (DB-only invariant checks, idempotency, overdraft, reversals, 6 concurrency) |
 
 Posting benchmark (`npm run bench`, 2,000 transfers per scenario, pool of 20, Postgres 17 in Docker on an Apple-silicon
 laptop, two runs):
