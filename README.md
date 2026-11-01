@@ -70,13 +70,46 @@ curl -s localhost:3001/transactions -H 'content-type: application/json' -H "idem
 with `reverses_id` pointing at the original. Nothing is edited: history shows the mistake and its undo. It goes
 through the same posting path, so it's idempotent and can't overdraw an account.
 
+## Fund layer
+
+A private fund's books built on the same ledger (`src/fund.ts`): LPs commit capital, the fund calls it, invests,
+charges fees, marks investments to fair value and distributes cash, and each LP gets a **capital account statement**.
+
+Every fund operation is one balanced ledger transaction, and the fund rules are the ledger's overdraft guard on
+the right account. There are no separate checks to keep in sync:
+
+| Rule | Enforced by |
+|---|---|
+| A call can't exceed an LP's unfunded commitment | per-LP `uncalled` memo account can't go negative |
+| An LP can't pay more than it owes | per-LP `receivable` can't go negative |
+| Fees and distributions need cash (called-but-unpaid isn't cash) | fund `cash` can't go negative |
+| Assets = sum of LP capital accounts | every transaction sums to zero |
+
+| Operation | Entries (positive = debit) |
+|---|---|
+| `issueCapitalCall` | `uncalled −s`, `commitments +S`, `receivable +s`, `contributions −s` per LP |
+| `recordCallPayment` | `cash +a`, `receivable −a` |
+| `chargeManagementFee` | `fees +f` per LP, `cash −F` |
+| `invest` | `investments ±a`, `cash ∓a` |
+| `recordValuation` | `investments +g`, `gains −g` per LP |
+| `distribute` | `distributions +d` per LP, `cash −D` |
+
+`getCapitalAccountStatement(fund, lp, from, to)` derives everything from entries by effective date: beginning
+balance, contributions, distributions, fees, gains, ending balance, called to date, unfunded commitment and
+outstanding calls. `npm run demo:fund` runs a year of a three-LP fund and prints them.
+
+**Allocation.** Pro rata shares are split with the largest remainder method, so they always sum to the exact
+total. Capital calls are weighted by *unfunded* commitment, not original commitment. Rounding every call by
+commitment hands the same LP the spare cent each time, and by the final call that LP is owed past its
+commitment, so the call fails. A test reproduces this.
+
 Design notes and open decisions: [DESIGN.md](DESIGN.md).
 
 ## Numbers
 
 | Metric | Value |
 |---|---|
-| Tests | 34 (DB-only invariant checks, idempotency, overdraft, reversals, 6 concurrency, 7 HTTP) |
+| Tests | 43 (DB-only invariant checks, idempotency, overdraft, reversals, 6 concurrency, 7 HTTP, 9 fund incl. concurrent calls) |
 
 HTTP load test (`npm run load`: server as its own process, autocannon, 20 connections, 10 s per scenario, unique
 `Idempotency-Key` per request; client, server and Postgres share one laptop; two runs):

@@ -24,6 +24,10 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
 | Amounts are JSON strings; numbers rejected | JSON numbers are IEEE doubles: integers above 2^53 round silently | never |
 | Replays return the same 201 + `Idempotent-Replayed` header | a retrying client shouldn't need a second code path | — |
 | Reversals obey the overdraft rule | reversing a spent deposit should be a human decision, not silent negative balance | modeling chargebacks (they can legitimately push an account negative) |
+| Fund rules = overdraft guards on memo/receivable/cash accounts | one enforcement path, already concurrency-safe under the row locks | rules that aren't "balance ≥ 0" (e.g. recycling limits) |
+| Calls allocated by unfunded commitment; fees, gains, distributions by commitment | per-call rounding by commitment drifts onto one LP until its last call fails | later closings / transfers (need ownership % over time) |
+| A fund op that builds entries from current balances replays by key before recomputing | a retry after another call would compute different entries, so a hash check would wrongly 409 | — |
+| Statement figures derived from entries by `effective_at`, nothing stored | one source of truth; any period can be re-run | statements must be frozen once sent (period close) |
 | Keys are global, not per client | single-tenant v1 | adding an API with clients: `unique (client_id, key)` + retention |
 
 ## Known gaps
@@ -36,6 +40,16 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
   ≈ 2,370 tx/s on disjoint pairs. Options: split a hot account into N sub-accounts, or skip the balance lock for
   `allow_negative` accounts (no overdraft check needed) and update their cache asynchronously.
 
+- Fund layer v1: one closing, fixed commitments, everything pro rata. No waterfall/carried interest, preferred
+  return, equalization for later closings, recallable distributions, or fee offsets. Fees are an input amount,
+  not computed from a rate.
+- Ties in pro rata rounding always go to the earlier LP (by id), so over many fees/distributions the same LP can
+  collect a few extra cents. Fix: rotate the tie-break, or allocate cumulatively.
+- Backdated entries silently change already-issued statements. Real administrators close a period and post
+  corrections in the current one.
+- Replay-by-key for capital calls skips the request-hash check, so reusing a key for a *different* call returns
+  the first call instead of a 409.
+
 ## Milestones (≤3 h each, green test + commit)
 - [x] Scaffold, schema with DB-enforced invariants, `postTransaction` + idempotency, 15 tests, CI
 - [x] Concurrency: parallel transfers stay zero-sum, no lost updates; same key fired 10× → one transaction;
@@ -43,4 +57,4 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
 - [x] Reversals: `reverseTransaction()` posts the negated entries, linked to the original; at most once (DB-enforced)
 - [x] Balances at scale: 1M and 10M entries, naive `SUM` vs cached read vs covering index (README)
 - [x] HTTP API (Fastify, `Idempotency-Key` header, string amounts, error codes) + p50/p99 under load (README)
-- [ ] Fund layer (capital calls, distributions, fees → capital account statement)
+- [x] Fund layer: capital calls, payments, fees, investments, valuations, distributions → capital account statement

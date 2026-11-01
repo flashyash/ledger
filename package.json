@@ -14,7 +14,8 @@
     "bench": "node scripts/bench-posting.ts",
     "bench:balances": "node scripts/bench-balances.ts",
     "start": "node src/server.ts",
-    "load": "node scripts/load.ts"
+    "load": "node scripts/load.ts",
+    "demo:fund": "node scripts/fund-demo.ts"
   },
   "type": "module",
   "private": true,

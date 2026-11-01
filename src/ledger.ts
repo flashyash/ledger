@@ -30,6 +30,11 @@ export class AccountNotFoundError extends Error {
 }
 export class InsufficientFundsError extends Error {
   name = "InsufficientFundsError";
+  readonly accountId: string; // the account that would have gone negative
+  constructor(message: string, accountId: string) {
+    super(message);
+    this.accountId = accountId;
+  }
 }
 export class IdempotencyConflictError extends Error {
   name = "IdempotencyConflictError";
@@ -231,7 +236,7 @@ async function post(pool: Pool, input: PostInput): Promise<PostResult> {
     for (const [id, delta] of deltas) {
       const acct = accounts.get(id)!;
       if (!acct.allow_negative && acct.balance + delta < 0n) {
-        throw new InsufficientFundsError(`account ${id} has ${acct.balance}, needs ${-delta}`);
+        throw new InsufficientFundsError(`account ${id} has ${acct.balance}, needs ${-delta}`, id);
       }
     }
 
@@ -339,4 +344,14 @@ export async function reconcile(pool: Pool): Promise<Drift[]> {
      having b.balance <> coalesce(sum(e.amount), 0)`,
   );
   return rows.map((r) => ({ accountId: r.account_id, cached: r.cached, actual: r.actual }));
+}
+
+// The transaction a key already produced, or null if the key is unused. Lets callers that build entries from current
+// state (and so may build different ones on a retry) replay before rebuilding. It skips the request-hash check.
+export async function findIdempotentResult(pool: Pool, key: string): Promise<string | null> {
+  const { rows } = await pool.query<{ transaction_id: string | null }>(
+    "select transaction_id from idempotency_keys where key = $1",
+    [key],
+  );
+  return rows[0]?.transaction_id ?? null;
 }
