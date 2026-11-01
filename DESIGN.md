@@ -21,10 +21,13 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
 | Idempotency key inserted in the same DB transaction as the posting | no "in-flight" state is ever visible; retries block, then replay | posting gains external side effects (then: commit key first, Stripe-style) |
 | Rejected requests (e.g. insufficient funds) don't store the key | the retry re-runs; simpler, and the client can fix and retry with the same key | clients need a failure to stay final |
 | No covering index on `entries (account_id) INCLUDE (amount)` | reads come from the cache; the index only speeds up reconcile/history and costs every insert | balance-as-of-date queries or reconcile get slow |
+| Amounts are JSON strings; numbers rejected | JSON numbers are IEEE doubles: integers above 2^53 round silently | never |
+| Replays return the same 201 + `Idempotent-Replayed` header | a retrying client shouldn't need a second code path | — |
 | Reversals obey the overdraft rule | reversing a spent deposit should be a human decision, not silent negative balance | modeling chargebacks (they can legitimately push an account negative) |
 | Keys are global, not per client | single-tenant v1 | adding an API with clients: `unique (client_id, key)` + retention |
 
 ## Known gaps
+- The API has no auth, rate limiting or per-client key scoping. Anyone who can reach it can move money between any accounts.
 - A later DB transaction could append a balanced pair of entries to an old transaction. Fix: reject entries whose
   transaction was created in a different DB transaction.
 - "A reversal's entries exactly negate the original's" is checked by construction in the app, not by the DB.
@@ -39,5 +42,5 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
       racing withdrawals can't overdraw; deadlock demo; posting benchmark (README)
 - [x] Reversals: `reverseTransaction()` posts the negated entries, linked to the original; at most once (DB-enforced)
 - [x] Balances at scale: 1M and 10M entries, naive `SUM` vs cached read vs covering index (README)
-- [ ] HTTP API (`POST /transfers` with `Idempotency-Key` header) + p50/p99 under load
+- [x] HTTP API (Fastify, `Idempotency-Key` header, string amounts, error codes) + p50/p99 under load (README)
 - [ ] Fund layer (capital calls, distributions, fees → capital account statement)

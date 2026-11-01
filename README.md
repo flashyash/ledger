@@ -12,6 +12,32 @@ npm install && npm run db:up && npm test
 Needs Node ≥ 24 and Docker. Postgres runs on `localhost:5433` (see `docker-compose.yml`); tests use a separate
 `ledger_test` database that is wiped on every run.
 
+Run the API (`http://127.0.0.1:3001`):
+
+```bash
+npm run migrate && npm start
+```
+
+## API
+
+| Method + path | Body | Success | Errors (`{ error, message }`) |
+|---|---|---|---|
+| `POST /accounts` | `{ name, currency, allowNegative? }` | 201 account | 400 |
+| `GET /accounts/:id` | — | 200 `{ id, name, currency, allowNegative, balance }` | 404 `account_not_found` |
+| `POST /transactions` | `{ entries: [{ accountId, amount }], description?, effectiveAt? }` | 201 `{ transactionId }` | 400, 404, 409 `idempotency_key_reused`, 422 `insufficient_funds` |
+| `GET /transactions/:id` | — | 200 with entries, `reversesId`, `reversedById` | 404 `transaction_not_found` |
+| `POST /transactions/:id/reverse` | `{ description? }` (optional) | 201 `{ transactionId }` | 404, 409 `already_reversed`, 422 |
+
+- `POST`s that move money require an `Idempotency-Key` header. A retry with the same key gets the same 201 and body,
+  plus `Idempotent-Replayed: true`. The same key with a different body is a 409.
+- Amounts are **strings** of integer minor units (`"-2500"` = −$25.00). JSON numbers, decimals and unknown fields are
+  rejected with 400, so nothing gets silently rounded or dropped.
+
+```bash
+curl -s localhost:3001/transactions -H 'content-type: application/json' -H "idempotency-key: $(uuidgen)" \
+  -d '{"entries":[{"accountId":"<from>","amount":"-2500"},{"accountId":"<to>","amount":"2500"}]}'
+```
+
 ## How it works
 
 | Table | Role |
@@ -50,7 +76,19 @@ Design notes and open decisions: [DESIGN.md](DESIGN.md).
 
 | Metric | Value |
 |---|---|
-| Tests | 27 (DB-only invariant checks, idempotency, overdraft, reversals, 6 concurrency) |
+| Tests | 34 (DB-only invariant checks, idempotency, overdraft, reversals, 6 concurrency, 7 HTTP) |
+
+HTTP load test (`npm run load`: server as its own process, autocannon, 20 connections, 10 s per scenario, unique
+`Idempotency-Key` per request; client, server and Postgres share one laptop; two runs):
+
+| Scenario | Throughput | p50 | p99 | Failed |
+|---|---|---|---|---|
+| `POST /transactions`, random pairs of 100 users | ~1,960 req/s | 8–9 ms | 26 ms | 0 |
+| `POST /transactions`, every one from `world` (hot account) | ~585 req/s | 39–40 ms | 80–105 ms | 0 |
+| `GET /accounts/:id` | ~17,300 req/s | 1 ms | 2–3 ms | 0 |
+
+`reconcile()` after each run: 0 drifted balances. The HTTP layer costs little: posting throughput is close to the
+direct-call benchmark below, so Postgres row locks and commits are the bottleneck, not the API.
 
 Posting benchmark (`npm run bench`, 2,000 transfers per scenario, pool of 20, Postgres 17 in Docker on an Apple-silicon
 laptop, two runs):

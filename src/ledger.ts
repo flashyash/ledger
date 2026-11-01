@@ -74,6 +74,74 @@ export async function getBalance(pool: Pool, accountId: string): Promise<bigint>
   return rows[0].balance;
 }
 
+export interface Account {
+  id: string;
+  name: string;
+  currency: string;
+  allowNegative: boolean;
+  balance: bigint;
+}
+
+export async function getAccount(pool: Pool, accountId: string): Promise<Account> {
+  if (!UUID.test(accountId)) throw new AccountNotFoundError(`account ${accountId} not found`);
+  const { rows } = await pool.query<{
+    id: string;
+    name: string;
+    currency: string;
+    allow_negative: boolean;
+    balance: bigint;
+  }>(
+    `select a.id, a.name, a.currency, a.allow_negative, b.balance
+       from accounts a join balances b on b.account_id = a.id where a.id = $1`,
+    [accountId],
+  );
+  if (rows.length === 0) throw new AccountNotFoundError(`account ${accountId} not found`);
+  const r = rows[0];
+  return { id: r.id, name: r.name, currency: r.currency, allowNegative: r.allow_negative, balance: r.balance };
+}
+
+export interface Transaction {
+  id: string;
+  description: string;
+  effectiveAt: Date;
+  postedAt: Date;
+  reversesId: string | null;
+  reversedById: string | null;
+  entries: { accountId: string; currency: string; amount: bigint }[];
+}
+
+export async function getTransaction(pool: Pool, transactionId: string): Promise<Transaction> {
+  if (!UUID.test(transactionId)) throw new TransactionNotFoundError(`transaction ${transactionId} not found`);
+  const { rows } = await pool.query<{
+    id: string;
+    description: string;
+    effective_at: Date;
+    posted_at: Date;
+    reverses_id: string | null;
+    reversed_by_id: string | null;
+  }>(
+    `select t.id, t.description, t.effective_at, t.posted_at, t.reverses_id, r.id as reversed_by_id
+       from transactions t left join transactions r on r.reverses_id = t.id
+      where t.id = $1`,
+    [transactionId],
+  );
+  if (rows.length === 0) throw new TransactionNotFoundError(`transaction ${transactionId} not found`);
+  const entries = await pool.query<{ account_id: string; currency: string; amount: bigint }>(
+    "select account_id, currency, amount from entries where transaction_id = $1 order by id",
+    [transactionId],
+  );
+  const t = rows[0];
+  return {
+    id: t.id,
+    description: t.description,
+    effectiveAt: t.effective_at,
+    postedAt: t.posted_at,
+    reversesId: t.reverses_id,
+    reversedById: t.reversed_by_id,
+    entries: entries.rows.map((e) => ({ accountId: e.account_id, currency: e.currency, amount: e.amount })),
+  };
+}
+
 export function postTransaction(pool: Pool, input: PostTransactionInput): Promise<PostResult> {
   return post(pool, input);
 }

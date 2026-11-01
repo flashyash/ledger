@@ -12,16 +12,21 @@
     "test": "vitest run",
     "typecheck": "tsc",
     "bench": "node scripts/bench-posting.ts",
-    "bench:balances": "node scripts/bench-balances.ts"
+    "bench:balances": "node scripts/bench-balances.ts",
+    "start": "node src/server.ts",
+    "load": "node scripts/load.ts"
   },
   "type": "module",
   "private": true,
   "dependencies": {
+    "fastify": "^5.12.7",
     "pg": "^8.23.1"
   },
   "devDependencies": {
+    "@types/autocannon": "^7.12.7",
     "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
+    "autocannon": "^8.0.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   },
