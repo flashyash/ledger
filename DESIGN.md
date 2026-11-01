@@ -20,6 +20,7 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
 | `READ COMMITTED` + explicit `FOR UPDATE` row locks, in account-id order | serializes only transfers that share an account; deterministic order prevents deadlocks | concurrency test results |
 | Idempotency key inserted in the same DB transaction as the posting | no "in-flight" state is ever visible; retries block, then replay | posting gains external side effects (then: commit key first, Stripe-style) |
 | Rejected requests (e.g. insufficient funds) don't store the key | the retry re-runs; simpler, and the client can fix and retry with the same key | clients need a failure to stay final |
+| No covering index on `entries (account_id) INCLUDE (amount)` | reads come from the cache; the index only speeds up reconcile/history and costs every insert | balance-as-of-date queries or reconcile get slow |
 | Reversals obey the overdraft rule | reversing a spent deposit should be a human decision, not silent negative balance | modeling chargebacks (they can legitimately push an account negative) |
 | Keys are global, not per client | single-tenant v1 | adding an API with clients: `unique (client_id, key)` + retention |
 
@@ -37,6 +38,6 @@ See the table in the README. Rule of thumb: the DB is the correctness floor, the
 - [x] Concurrency: parallel transfers stay zero-sum, no lost updates; same key fired 10× → one transaction;
       racing withdrawals can't overdraw; deadlock demo; posting benchmark (README)
 - [x] Reversals: `reverseTransaction()` posts the negated entries, linked to the original; at most once (DB-enforced)
-- [ ] Balances at scale: seed ~1M entries, time naive `SUM` vs cached read
+- [x] Balances at scale: 1M and 10M entries, naive `SUM` vs cached read vs covering index (README)
 - [ ] HTTP API (`POST /transfers` with `Idempotency-Key` header) + p50/p99 under load
 - [ ] Fund layer (capital calls, distributions, fees → capital account statement)

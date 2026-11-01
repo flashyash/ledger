@@ -64,6 +64,21 @@ laptop, two runs):
 A hot account barely scales: every posting holds its row lock from `FOR UPDATE` to `COMMIT`, so the 20 workers mostly
 queue. Spread across accounts, the same code does ~4× the throughput.
 
+Balance reads (`npm run bench:balances`, warm cache, 30 runs each; 1 `world` account on one side of every deposit,
+1,000 users). Seed is bulk-loaded, then verified: every transaction balances and 0 cached balances drift.
+
+| Balance read, p50 (p99) | 1M entries | 10M entries |
+|---|---|---|
+| Cached `balances` row | 0.31 ms (0.37) | 0.32 ms (0.48) |
+| `SUM`, typical user (500 / 5,000 entries) | 0.42 ms (0.49) | 1.89 ms (2.67) |
+| `SUM`, `world` (500k / 5M entries) | 24.9 ms (34.6) | 191.6 ms (209.3) |
+| `SUM`, `world`, covering index forced | 17.2 ms (25.1) | 141.3 ms (176.9) |
+| `reconcile()`, all accounts | 98 ms | 1,215 ms |
+
+The cached read stays flat; `SUM` grows linearly with the account's history (~600× slower than the cache for `world`
+at 10M). A covering index `(account_id) INCLUDE (amount)` makes `SUM` an index-only scan, which helps small accounts
+but is still linear, and for `world` the planner ignored it in favor of a parallel seq scan unless forced.
+
 ## What I learned / what I'd do differently
 
 _To fill in as the project goes._

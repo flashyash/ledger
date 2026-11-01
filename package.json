@@ -11,7 +11,8 @@
     "migrate": "node src/migrate.ts",
     "test": "vitest run",
     "typecheck": "tsc",
-    "bench": "node scripts/bench-posting.ts"
+    "bench": "node scripts/bench-posting.ts",
+    "bench:balances": "node scripts/bench-balances.ts"
   },
   "type": "module",
   "private": true,
